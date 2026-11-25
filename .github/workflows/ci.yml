@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [ci/469-welcome-update-validation]
   pull_request:
   # The merge queue runs CI on the merged result; without this its required check never reports.
   merge_group:
