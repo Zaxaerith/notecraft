@@ -1,0 +1,61 @@
+name: Issue 577 contribution gate
+
+on:
+  push:
+    branches: [ci/577-contribution-gate]
+
+permissions:
+  contents: write
+
+env:
+  DELIVERY_BRANCH: fix/577-secondary-window-titlebar
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "1"
+  CARGO_PROFILE_TEST_DEBUG: "1"
+  GIT_LFS_SKIP_SMUDGE: "1"
+
+jobs:
+  contribution-gate:
+    if: github.repository == 'Zaxaerith/notecraft' && github.actor == 'Zaxaerith'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Apply the complete patch to current upstream main
+        shell: bash
+        run: |
+          cp .github/issue-577.patch "$RUNNER_TEMP/issue-577.patch"
+          git remote rename origin fork
+          git remote add origin https://github.com/AlienTechSoftware/notecraft.git
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          git switch --create "$DELIVERY_BRANCH" origin/main
+          git config core.hooksPath .githooks
+          git apply --index "$RUNNER_TEMP/issue-577.patch"
+          git diff --cached --check
+          git diff --cached --stat
+      - name: Install the upstream toolchain and Linux dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgtk-3-dev libfontconfig1-dev libfreetype-dev libvulkan1 mesa-vulkan-drivers
+          rustup install
+      - name: Commit with upstream pre-commit and commit-msg hooks
+        shell: bash
+        run: |
+          git config user.name Zaxaerith
+          git config user.email "${GITHUB_ACTOR_ID}+Zaxaerith@users.noreply.github.com"
+          git commit -m 'fix(ui-egui): remove duplicate title bars from secondary windows'
+      - name: Run the full upstream pre-push gate
+        run: cargo xtask pre-push
+      - name: Push the validated commit with the upstream pre-push hook
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push fork "HEAD:refs/heads/$DELIVERY_BRANCH"
+          printf 'Validated commit: `%s`\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          git rev-parse HEAD

@@ -1,0 +1,325 @@
+diff --git a/crates/ui-egui/src/app.rs b/crates/ui-egui/src/app.rs
+index 733038a9..d7777498 100644
+--- a/crates/ui-egui/src/app.rs
++++ b/crates/ui-egui/src/app.rs
+@@ -1590,9 +1590,16 @@ const HIDE_AUTHORS_KEY: &str = "hide_authors";
+ /// The version `--new-version` shows when no version is given. It is never downloaded.
+ pub const SIMULATED_NEW_VERSION: &str = "0.0.99";
+ 
++#[derive(PartialEq, Eq)]
++enum WindowKind {
++    Primary,
++    Note,
++    QuickNote,
++}
++
+ pub struct NoteCraftApp {
+     window_requests: Vec<crate::windows::Request>,
+-    secondary_window: bool,
++    window_kind: WindowKind,
+     native_hosted: bool,
+     native_close: std::cell::Cell<bool>,
+     page_revision: Option<crate::windows::Revision>,
+@@ -1984,7 +1991,7 @@ impl NoteCraftApp {
+             status_is_error: false,
+             session_only_storage: false,
+             window_requests: Vec::new(),
+-            secondary_window: false,
++            window_kind: WindowKind::Primary,
+             native_hosted: false,
+             native_close: std::cell::Cell::new(false),
+             page_revision: None,
+@@ -2229,7 +2236,7 @@ impl NoteCraftApp {
+     /// and how far down the page is scrolled.
+     pub fn before_close(&mut self) {
+         self.save_now();
+-        if self.secondary_window {
++        if self.window_kind != WindowKind::Primary {
+             return;
+         }
+         let _ = self.session.settings.set(LAST_ZOOM_KEY, &self.zoom_percent.to_string());
+@@ -2239,7 +2246,7 @@ impl NoteCraftApp {
+     /// Remembers which page is open, for the next time the window starts.
+     fn remember_last_page(&mut self, dir: &Path, another_page: bool) {
+         // A note window of its own is not where the window was left.
+-        if self.secondary_window {
++        if self.window_kind != WindowKind::Primary {
+             return;
+         }
+         // Inside the notebooks folder by its place there; a notebook kept elsewhere (a synced
+@@ -5631,12 +5638,11 @@ impl NoteCraftApp {
+         let mic = self.dictation_mic();
+         #[cfg(not(feature = "voice"))]
+         let mic = ribbon::Mic::Hidden;
+-        let title = self.editor.as_ref().map(|e| e.title.trim().to_owned()).filter(|s| !s.is_empty());
+         let mut acts = Vec::new();
+         let collapsed = self.ribbon_folded();
+         let band = egui::Panel::top("band").frame(egui::Frame::new().fill(t.band)).show_separator_line(false).show(ui, |ui| {
+             ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
+-            self.title_row(ui, title.as_deref());
++            self.title_row(ui);
+             if with_tabs {
+                 ribbon::tab_strip(ui, &tab, source, in_table, collapsed, mic, &t, &mut acts);
+             }
+@@ -5647,8 +5653,13 @@ impl NoteCraftApp {
+         }
+     }
+ 
+-    /// The band's first row. Anything on it that is not a control moves the window.
+-    fn title_row(&mut self, ui: &mut Ui, title: Option<&str>) {
++    fn window_title(&self) -> String {
++        let title = self.editor.as_ref().map(|editor| editor.title.trim()).filter(|title| !title.is_empty());
++        title.map_or_else(|| "NoteCraft".to_owned(), |title| format!("{title} - NoteCraft"))
++    }
++
++    /// The band's first row. Bare space is a drag target for the app's own frame.
++    fn title_row(&mut self, ui: &mut Ui) {
+         const H: f32 = 30.0;
+         let on = self.tokens.on_band();
+         let ctx = ui.ctx().clone();
+@@ -5674,7 +5685,6 @@ impl NoteCraftApp {
+                 ui.close();
+             }
+         });
+-        let text = title.map_or_else(|| "NoteCraft".to_owned(), |t| format!("{t} - NoteCraft"));
+         let mut left = ui.new_child(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::left_to_right(egui::Align::Center)));
+         left.add_space(8.0);
+         left.add(egui::Image::from_bytes("bytes://notecraft-logo", crate::LOGO_PNG).fit_to_exact_size(vec2(18.0, 18.0)));
+@@ -5732,6 +5742,12 @@ impl NoteCraftApp {
+                 self.search_pick = self.search_pick.and_then(|n| n.checked_sub(1));
+             }
+         }
++        // System-framed note windows put the title in the native caption and keep this row for app controls.
++        if self.window_kind == WindowKind::Note && !self.frameless {
++            ui.advance_cursor_after_rect(row);
++            return;
++        }
++        let text = self.window_title();
+         // Issue #371: the page's title gets the room between the controls on both sides and
+         // no more. It is centred on the window when it fits there, otherwise in the room it
+         // has, and cut with an ellipsis rather than running under the search box. The whole
+@@ -14982,7 +14998,7 @@ impl NoteCraftApp {
+             "windowFrame": if self.frameless { "own" } else { "system" },
+             "quickAccess": {"shown": self.qat.show, "below": self.qat.below, "hidden": self.qat.hidden},
+             // Folded to its tab names (Ctrl+F1), and whether a clicked tab shows it over the page.
+-            "window": {"secondary": self.secondary_window, "conflict": self.page_conflict},
++            "window": {"secondary": self.window_kind != WindowKind::Primary, "conflict": self.page_conflict},
+             "ribbon": {"collapsed": self.ribbon_collapsed, "shown": !self.ribbon_folded() || self.ribbon_peek, "tab": self.ribbon_tab},
+             // Whether a dialog is up over the window (Android's Back closes it first).
+             "dialogOpen": self.dialog.is_some(),
+diff --git a/crates/ui-egui/src/app/window_capture.rs b/crates/ui-egui/src/app/window_capture.rs
+index e0ce4269..fdeb1e54 100644
+--- a/crates/ui-egui/src/app/window_capture.rs
++++ b/crates/ui-egui/src/app/window_capture.rs
+@@ -72,13 +72,14 @@ impl NoteCraftApp {
+     pub fn child_window(&self, request: &crate::windows::Request) -> Result<Self, String> {
+         let session = Session::new(self.session.root(), self.session.settings.clone()).map_err(|e| e.to_string())?;
+         let mut child = Self::new(session);
+-        child.secondary_window = true;
++        child.window_kind = if request.quick { WindowKind::QuickNote } else { WindowKind::Note };
+         child.restored = true;
+-        child.frameless = false;
+         child.ui_scale_pending = false;
+         if request.quick {
+             child.full_page = true;
+             child.ribbon_collapsed = true;
++        } else {
++            child.frameless = child.session.settings.get("window_frame").as_deref() != Some("system");
+         }
+         if notecraft_store::tree::page_file(&request.path).is_some() {
+             child.open_path(&path_str(&request.path));
+@@ -89,6 +90,17 @@ impl NoteCraftApp {
+         Ok(child)
+     }
+ 
++    pub(crate) fn child_viewport_builder(&self) -> egui::ViewportBuilder {
++        let (title, size) = if self.window_kind == WindowKind::QuickNote {
++            (crate::tl_id!("ui.window_quick_title").to_owned(), [520.0, 440.0])
++        } else {
++            (self.window_title(), [1100.0, 760.0])
++        };
++        // The conflict screen replaces the app's chrome, so a note needs native controls there.
++        let decorations = !self.frameless || (self.window_kind == WindowKind::Note && self.page_conflict);
++        egui::ViewportBuilder::default().with_title(title).with_inner_size(size).with_min_inner_size([360.0, 280.0]).with_decorations(decorations)
++    }
++
+     /// Finish the title after the body, since a matching first heading is also renamed.
+     pub(super) fn save_pending_title(&mut self) {
+         let Some((dir, title, expected)) = self
+diff --git a/crates/ui-egui/src/windows.rs b/crates/ui-egui/src/windows.rs
+index d688af94..650b5ac7 100644
+--- a/crates/ui-egui/src/windows.rs
++++ b/crates/ui-egui/src/windows.rs
+@@ -20,10 +20,6 @@ struct Child {
+     app: NoteCraftApp,
+     closing: bool,
+ }
+-struct Window {
+-    id: egui::ViewportId,
+-    quick: bool,
+-}
+ 
+ thread_local! {
+     static CHILDREN: RefCell<BTreeMap<egui::ViewportId, Child>> = const { RefCell::new(BTreeMap::new()) };
+@@ -32,7 +28,7 @@ thread_local! {
+ /// Owns the window identities; editor handles remain on the native event-loop thread.
+ pub struct Host {
+     pub primary: NoteCraftApp,
+-    windows: Vec<Window>,
++    windows: Vec<egui::ViewportId>,
+     next: u64,
+     primary_closed: bool,
+ }
+@@ -47,7 +43,7 @@ impl Host {
+         if id == egui::ViewportId::ROOT {
+             return Some(f(&mut self.primary));
+         }
+-        if !self.windows.iter().any(|w| w.id == id) {
++        if !self.windows.contains(&id) {
+             return None;
+         }
+         CHILDREN.with(|views| views.try_borrow_mut().ok()?.get_mut(&id).map(|child| f(&mut child.app)))
+@@ -62,12 +58,12 @@ impl Host {
+         self.with_view(id, NoteCraftApp::take_events).unwrap_or_default()
+     }
+ 
+-    fn add_window(&mut self, mut app: NoteCraftApp, quick: bool) {
++    fn add_window(&mut self, mut app: NoteCraftApp) {
+         app.prepare_native_view();
+         self.next += 1;
+         let id = egui::ViewportId::from_hash_of(("note-window", self.next));
+         CHILDREN.with(|views| views.borrow_mut().insert(id, Child { app, closing: false }));
+-        self.windows.push(Window { id, quick });
++        self.windows.push(id);
+     }
+ 
+     pub fn show(&mut self, ui: &mut egui::Ui) {
+@@ -114,8 +110,8 @@ impl Host {
+         });
+         if ready {
+             self.primary.request_window_close(ctx);
+-            for window in &self.windows {
+-                ctx.send_viewport_cmd_to(window.id, egui::ViewportCommand::Close);
++            for &id in &self.windows {
++                ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Close);
+             }
+         } else {
+             self.primary_closed = false;
+@@ -142,11 +138,11 @@ impl Host {
+         let mut closed = Vec::new();
+         CHILDREN.with(|views| {
+             let mut views = views.borrow_mut();
+-            for window in &self.windows {
+-                if let Some(child) = views.get_mut(&window.id) {
+-                    requests.extend(child.app.take_window_requests().into_iter().map(|r| (window.id, r)));
++            for &id in &self.windows {
++                if let Some(child) = views.get_mut(&id) {
++                    requests.extend(child.app.take_window_requests().into_iter().map(|r| (id, r)));
+                     if child.closing {
+-                        closed.push(window.id);
++                        closed.push(id);
+                     }
+                 }
+             }
+@@ -171,7 +167,7 @@ impl Host {
+                             child.app.session_mut().refresh();
+                         }
+                     });
+-                    self.add_window(child, request.quick);
++                    self.add_window(child);
+                     ctx.request_repaint();
+                 }
+                 Err(e) => {
+@@ -179,24 +175,18 @@ impl Host {
+                 }
+             }
+         }
+-        self.windows.retain(|window| !closed.contains(&window.id));
++        self.windows.retain(|id| !closed.contains(id));
+         CHILDREN.with(|views| {
+             let mut views = views.borrow_mut();
+             for id in closed {
+                 views.remove(&id);
+             }
+         });
+-        for window in &self.windows {
+-            let id = window.id;
+-            let size = if window.quick { [520.0, 440.0] } else { [1100.0, 760.0] };
+-            let title = if window.quick { crate::tl_id!("ui.window_quick_title") } else { "NoteCraft" };
+-            ctx.show_viewport_deferred(
+-                id,
+-                egui::ViewportBuilder::default().with_title(title).with_inner_size(size).with_min_inner_size([360.0, 280.0]),
+-                move |ui, _class| {
+-                    render_child(id, ui);
+-                },
+-            );
++        for &id in &self.windows {
++            let builder = CHILDREN.with(|views| views.borrow()[&id].app.child_viewport_builder());
++            ctx.show_viewport_deferred(id, builder, move |ui, _class| {
++                render_child(id, ui);
++            });
+         }
+         if self.primary_closed && self.windows.is_empty() {
+             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+@@ -241,8 +231,8 @@ impl Drop for Host {
+     fn drop(&mut self) {
+         CHILDREN.with(|views| {
+             if let Ok(mut views) = views.try_borrow_mut() {
+-                for window in &self.windows {
+-                    views.remove(&window.id);
++                for id in &self.windows {
++                    views.remove(id);
+                 }
+             }
+         });
+@@ -253,6 +243,32 @@ impl Drop for Host {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn note_viewports_follow_the_frame_preference_and_quick_notes_keep_their_frame() {
++        let t = notecraft_store::testing::TempDir::new("secondary-window-frame");
++        let settings = notecraft_store::Settings::at(t.path().join("settings.toml"));
++        settings.set("privacy_welcome_seen", "true").expect("settings");
++        let mut session = notecraft_engine::Session::new(&t.path().join("notebooks"), settings.clone()).expect("session");
++        let sample = notecraft_engine::sample::create_sample(&mut session, None).expect("sample");
++        let primary = NoteCraftApp::new(session);
++        let mut request = Request { path: sample.html_page, quick: false };
++
++        for (preference, decorations) in [(None, false), (Some("own"), false), (Some("system"), true)] {
++            if let Some(preference) = preference {
++                settings.set("window_frame", preference).expect("save frame preference");
++            }
++            let note = primary.child_window(&request).expect("note window").child_viewport_builder();
++            assert_eq!(note.decorations, Some(decorations));
++            assert_eq!(note.title.as_deref(), Some("Project X - NoteCraft"));
++        }
++
++        settings.set("window_frame", "own").expect("save frame preference");
++        request.quick = true;
++        let quick = primary.child_window(&request).expect("quick note window").child_viewport_builder();
++        assert_eq!(quick.decorations, Some(true));
++        assert_eq!(quick.title.as_deref(), Some(crate::tl_id!("ui.window_quick_title")));
++    }
++
+     /// A managed child must save before the host disposes its native window.
+     #[test]
+     fn managed_close_saves_then_queues_without_a_backend_close_command() {
+@@ -291,7 +307,7 @@ mod tests {
+         let primary = NoteCraftApp::new(session);
+         let child = primary.child_window(&Request { path: primary.session().root().to_path_buf(), quick: true }).expect("child");
+         let mut host = Host::new(primary);
+-        host.add_window(child, true);
++        host.add_window(child);
+         let ctx = egui::Context::default();
+         host.request_update_close(&ctx);
+         assert!(host.primary.take_native_close());
+@@ -308,7 +324,7 @@ mod tests {
+         let child = primary.child_window(&Request { path: primary.session().root().to_path_buf(), quick: true }).expect("child");
+         let mut host = Host::new(primary);
+         host.primary_closed = true;
+-        host.add_window(child, true);
++        host.add_window(child);
+         let ctx = egui::Context::default();
+         let output = ctx.run_logic(&egui::RawInput::default(), |ctx| host.logic(ctx));
+         assert!(
